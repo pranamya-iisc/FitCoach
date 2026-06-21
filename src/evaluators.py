@@ -186,12 +186,14 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
             Temporal F-score (float).
         """
         # Match ground truth feedbacks to predicted feedbacks (recall)
-        num_matched_gt, _, matched_feedbacks = self._get_temporally_aligned_feedbacks(
-            gt_feedback_timestamps, pred_feedback_timestamps, gt_feedbacks, pred_feedbacks
+        num_matched_gt, _, matched_feedbacks, matched_timestamps = (
+            self._get_temporally_aligned_feedbacks(
+                gt_feedback_timestamps, pred_feedback_timestamps, gt_feedbacks, pred_feedbacks
+            )
         )
 
         # Match predicted feedbacks to ground truth feedbacks (precision)
-        _, num_matched_preds, _ = self._get_temporally_aligned_feedbacks(
+        _, num_matched_preds, _, _ = self._get_temporally_aligned_feedbacks(
             pred_feedback_timestamps, gt_feedback_timestamps, pred_feedbacks, gt_feedbacks
         )
 
@@ -209,7 +211,7 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
             t_f_score_running_stats["total_num_gt_feedbacks"] + eps
         )
         f_score = 2 * ((precision * recall) / (precision + recall + eps))
-        return f_score, matched_feedbacks, t_f_score_running_stats
+        return f_score, matched_feedbacks, matched_timestamps, t_f_score_running_stats
 
     def _extract_pred_feedbacks(
         self, output: list[int], feats_frequency: int
@@ -344,12 +346,16 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
                 tolerance,
             )
 
+        matched_timestamps = []
         for match_idx, match_jdx in zip(matching_row_idxs, matching_col_idxs):
             matched_feedbacks.append((gt_feedbacks[match_idx], pred_feedbacks[match_jdx]))
+            matched_timestamps.append(
+                (gt_feedback_timestamps[match_idx], pred_feedback_timestamps[match_jdx])
+            )
             matched_idxs_gt.append(match_idx)
             matched_idxs_pred.append(match_jdx)
 
-        return len(matched_idxs_gt), len(matched_idxs_pred), matched_feedbacks
+        return len(matched_idxs_gt), len(matched_idxs_pred), matched_feedbacks, matched_timestamps
 
     @staticmethod
     def _get_video_for_episode(
@@ -395,10 +401,30 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
 
     @staticmethod
     def _update_save_feedbacks_dict(
-        save_dict_list: List[dict], matched_feedbacks: List[Tuple[str, str]]
+        save_dict_list: List[dict],
+        matched_feedbacks: List[Tuple[str, str]],
+        matched_timestamps: List[Tuple[float, float]],
+        meteor_scores: List[float],
+        rouge_scores: List[float],
+        bert_scores: List[float],
+        video_id: str,
+        episode_start_timestamp: float,
+        episode_end_timestamp: float,
     ) -> List[dict]:
-        for gt_feedback, pred_feedback in matched_feedbacks:
-            save_dict_list.append({"GT": gt_feedback, "Pred": pred_feedback})
+        for i, (gt_feedback, pred_feedback) in enumerate(matched_feedbacks):
+            entry = {
+                "video_id": video_id,
+                "episode_start_timestamp": round(episode_start_timestamp, 3),
+                "episode_end_timestamp": round(episode_end_timestamp, 3),
+                "gt_timestamp": round(matched_timestamps[i][0], 3),
+                "pred_timestamp": round(matched_timestamps[i][1], 3),
+                "GT": gt_feedback,
+                "Pred": pred_feedback,
+                "meteor": round(meteor_scores[i], 4) if i < len(meteor_scores) else None,
+                "rouge_l": round(rouge_scores[i], 4) if i < len(rouge_scores) else None,
+                "bert": round(bert_scores[i], 4) if i < len(bert_scores) else None,
+            }
+            save_dict_list.append(entry)
         return save_dict_list
 
     @staticmethod
@@ -515,18 +541,27 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
             )
 
             # Compute metrics
-            t_f_score, matched_feedbacks, t_f_score_running_stats = self._compute_temporal_fscore(
-                gt_feedbacks,
-                pred_feedbacks,
-                gt_feedback_timestamps,
-                pred_feedback_timestamps,
-                t_f_score_running_stats,
+            t_f_score, matched_feedbacks, matched_timestamps, t_f_score_running_stats = (
+                self._compute_temporal_fscore(
+                    gt_feedbacks,
+                    pred_feedbacks,
+                    gt_feedback_timestamps,
+                    pred_feedback_timestamps,
+                    t_f_score_running_stats,
+                )
             )
 
-            rouge_scores += self._compute_rouge_scores(matched_feedbacks)
-            meteor_scores += self._compute_meteor_scores(matched_feedbacks)
+            episode_rouge = self._compute_rouge_scores(matched_feedbacks)
+            episode_meteor = self._compute_meteor_scores(matched_feedbacks)
+            episode_bert = (
+                self._compute_bert_scores(matched_feedbacks)
+                if self.bert_score is not None
+                else [None] * len(matched_feedbacks)
+            )
+            rouge_scores += episode_rouge
+            meteor_scores += episode_meteor
             if self.bert_score is not None:
-                bert_scores += self._compute_bert_scores(matched_feedbacks)
+                bert_scores += episode_bert
 
             # Print a running summary of metrics
             self._print_eval_summary(
@@ -541,7 +576,18 @@ class InteractiveFeedbackEvaluator(VisionLanguageEvaluator):
             )
 
             # Update save dict
-            self._update_save_feedbacks_dict(matched_feedbacks_to_save, matched_feedbacks)
+            video_id = os.path.splitext(os.path.basename(feat_path))[0]
+            self._update_save_feedbacks_dict(
+                matched_feedbacks_to_save,
+                matched_feedbacks,
+                matched_timestamps,
+                episode_meteor,
+                episode_rouge,
+                episode_bert,
+                video_id=video_id,
+                episode_start_timestamp=episode_start_timestamp,
+                episode_end_timestamp=episode_end_timestamp,
+            )
 
         # Save feedbacks
         self._dump_pred_feedbacks(matched_feedbacks_to_save, self.feedbacks_save_path)
